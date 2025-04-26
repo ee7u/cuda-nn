@@ -13,16 +13,6 @@
 #define ROWS_PER_FILE 10000
 #define N_FILES 5
 
-typedef struct Linear
-{
-    float *w;
-    float *b;
-    float *w_grad;
-    float *b_grad;
-    size_t shape_in;
-    size_t shape_out;
-} Linear;
-
 typedef struct Model
 {
     size_t n_params;
