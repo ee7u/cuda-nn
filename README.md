@@ -2,4 +2,4 @@ Neural networks in C and cuda for learning purposes. The point is not to make a 
 
 Some of the code has been taken and modified from llm.c. 
 
-So far this is only a naive CPU implementation, the more interesting stuff is WIP.
+train_cifar.c contains a simple CPU implementation. train_cifar.cu contains a naive cuda implementation of the same model. Optimization is WIP.
