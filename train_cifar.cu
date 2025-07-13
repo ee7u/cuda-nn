@@ -4,6 +4,7 @@
 #include <math.h>
 #include <time.h>
 #include <assert.h>
+#include <string.h>
 
 #define IMG_SIZE 3072
 #define BATCH_SIZE 32
@@ -551,7 +552,7 @@ void model_forward_backward(Model* model, Acts* acts, float* imgs, int* labels, 
     crossentropy_forward(acts->loss, acts->softmax_out, labels, BATCH_SIZE, N_CLASSES);
 
     float dloss_mean = 1.0f / (BATCH_SIZE);
-    for (int b = 0; b < BATCH_SIZE; b++) { 
+    for (int b = 0; b < BATCH_SIZE; b++) {
         acts->dloss[b] = dloss_mean;
     }
 
@@ -753,18 +754,55 @@ void compare_cpu_gpu() {
         assert(fequal(cpu_l1_b_grad[i], gpu_l1_b_grad[i]));
     }
 
-    free_model_cuda(model);
-    free_acts_cuda(acts_d);
-    free_acts(acts);
-    free_acts(gpu_acts);
-    free(data);
-    free(labels);
-    free(imgs);
+    printf("Tests passed!\n");
 }
 
-int main() {
-    srand(time(NULL));
+void train_cpu() {
+    unsigned char* data = (unsigned char*)malloc(N_FILES*ROWS_PER_FILE*(IMG_SIZE+1));
+    load_data(data);
 
+    size_t train_samples = 40000;
+    size_t test_samples = 10000;
+    unsigned char* train_data = data;
+    unsigned char* test_data = data+train_samples*(IMG_SIZE+1);
+
+    Model model = allocate_model();
+    init_linear(model.l1_w, model.l1_b, IMG_SIZE, HIDDEN_SIZE);
+    init_linear(model.l2_w, model.l2_b, HIDDEN_SIZE, N_CLASSES);
+    Acts acts = allocate_acts();
+
+    int* labels = (int*)malloc(sizeof(int)*BATCH_SIZE);
+    float* imgs = (float*)malloc(sizeof(float)*BATCH_SIZE*IMG_SIZE);
+    for (int batch_i = 0; batch_i < N_BATCHES; batch_i++) {
+        printf("\b%d/%d steps\r", batch_i, N_BATCHES);
+        fflush(stdout);
+        get_batch(train_data, imgs, labels, train_samples);
+        model_forward_backward(&model, &acts, imgs, labels, batch_i, true);
+    }
+
+    int n_test_samples = 0;
+    int n_correct = 0;
+    for (int i = 0; i < floor(test_samples/BATCH_SIZE); i++) {
+        for (int b = 0; b < BATCH_SIZE; b++) {
+            labels[b] = test_data[(i*BATCH_SIZE + b)*(IMG_SIZE+1)];
+            for (int j = 0; j < IMG_SIZE; j++) {
+                imgs[b*IMG_SIZE+j] = (float)(test_data[(i*BATCH_SIZE + b)*(IMG_SIZE+1)+j+1])/255;
+            }
+        }
+
+        model_forward(&model, &acts, imgs);
+        for (int b = 0; b < BATCH_SIZE; b++) {
+            int pred = array_argmax(acts.l2_out+b*N_CLASSES, N_CLASSES);
+            if (pred == labels[b]) {
+                n_correct++;
+            }
+            n_test_samples++;
+        }
+    }
+    printf("Accuracy: %f\n", ((float)n_correct)/n_test_samples);
+}
+
+void train_gpu() {
     unsigned char* data = (unsigned char*)malloc(N_FILES*ROWS_PER_FILE*(IMG_SIZE+1));
     load_data(data);
 
@@ -820,9 +858,25 @@ int main() {
         }
     }
     printf("Accuracy: %f\n", ((float)n_correct)/n_test_samples);
+}
 
-    free(data);
-    free(labels);
-    free(imgs);
+int main(int argc, char* argv[]) {
+    srand(time(NULL));
+
+    if (argc == 1) {
+        train_gpu();
+    }
+    else {
+        if (strcasecmp(argv[1], "CPU") == 0) {
+            train_cpu();
+        } else if (strcasecmp(argv[1], "TEST") == 0) {
+            compare_cpu_gpu();
+        } else if (strcasecmp(argv[1], "GPU") == 0) {
+            train_gpu();
+        } else {
+            assert(false && "Invalid argument");
+        }
+    }
+
     return 0;
 }
