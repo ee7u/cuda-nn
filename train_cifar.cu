@@ -7,7 +7,7 @@
 #include <string.h>
 
 #define IMG_SIZE 3072
-#define BATCH_SIZE 32
+#define BATCH_SIZE 256
 #define N_BATCHES 1000
 #define N_CLASSES 10
 #define HIDDEN_SIZE 32
@@ -767,13 +767,21 @@ void train_cpu() {
 
     int* labels = (int*)malloc(sizeof(int)*BATCH_SIZE);
     float* imgs = (float*)malloc(sizeof(float)*BATCH_SIZE*IMG_SIZE);
+
+    clock_t total_time = 0;
     for (int batch_i = 0; batch_i < N_BATCHES; batch_i++) {
-        printf("\b%d/%d steps\r", batch_i, N_BATCHES);
+        printf("\b%d/%d steps\r", batch_i+1, N_BATCHES);
         fflush(stdout);
+
+        clock_t batch_start = clock();
         get_batch(train_data, imgs, labels, train_samples);
         model_forward_backward(&model, &acts, imgs, labels);
         update_params(&model, LR, BETA1, BETA2, EPS, WEIGHT_DECAY, batch_i+1);
+        total_time += (clock() - batch_start);
     }
+
+    double avg_batch_time = ((double)total_time) / CLOCKS_PER_SEC / N_BATCHES;
+    printf("\nAverage batch time (CPU): %.6f seconds\n", avg_batch_time);
 
     int n_test_samples = 0;
     int n_correct = 0;
@@ -819,9 +827,13 @@ void train_gpu() {
 
     int* labels = (int*)malloc(sizeof(int)*BATCH_SIZE);
     float* imgs = (float*)malloc(sizeof(float)*BATCH_SIZE*IMG_SIZE);
+
+    clock_t total_time = 0;
     for (int batch_i = 0; batch_i < N_BATCHES; batch_i++) {
-        printf("\b%d/%d steps\r", batch_i, N_BATCHES);
+        printf("\b%d/%d steps\r", batch_i+1, N_BATCHES);
         fflush(stdout);
+
+        clock_t batch_start = clock();
         get_batch(train_data, imgs, labels, train_samples);
         cudaMemcpy(labels_d, labels, sizeof(int)*BATCH_SIZE, cudaMemcpyHostToDevice);
         cudaMemcpy(imgs_d, imgs, sizeof(float)*BATCH_SIZE*IMG_SIZE, cudaMemcpyHostToDevice);
@@ -830,7 +842,11 @@ void train_gpu() {
         dim3 blockDimu(32, 1, 1);
         update_params_cuda<<<gridDimu,  blockDimu>>>(model.n_params, model.params, model.grads, model.m, model.v, LR, BETA1, BETA2, EPS, WEIGHT_DECAY, batch_i+1);
         model_forward_backward_cuda(&model, &acts, imgs_d, labels_d);
+        total_time += (clock() - batch_start);
     }
+
+    double avg_batch_time = ((double)total_time) / CLOCKS_PER_SEC / N_BATCHES;
+    printf("\nAverage batch time (GPU): %.6f seconds\n", avg_batch_time);
 
     int n_test_samples = 0;
     int n_correct = 0;
