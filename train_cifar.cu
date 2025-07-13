@@ -13,6 +13,12 @@
 #define HIDDEN_SIZE 32
 #define ROWS_PER_FILE 10000
 #define N_FILES 5
+#define LR 1e-3f
+#define BETA1 0.9f
+#define BETA2 0.999f
+#define WEIGHT_DECAY 0.0f
+#define EPS 1e-8f
+
 
 #define L1_OUT_SIZE (BATCH_SIZE*HIDDEN_SIZE)
 #define RELU_OUT_SIZE (BATCH_SIZE*HIDDEN_SIZE)
@@ -493,7 +499,7 @@ void update_params(Model* model, float lr, float beta1, float beta2, float eps, 
     }
 }
 
-__global__ void update_params_cuda(const int n_params, float* params, float* grads, float* ms, float* vs, const float lr, const float beta1, const float beta2, const float eps, const float weight_decay, const int t, const float beta1_correct, const float beta2_correct) {
+__global__ void update_params_cuda(const int n_params, float* params, float* grads, float* ms, float* vs, const float lr, const float beta1, const float beta2, const float eps, const float weight_decay, const int t) {
     const uint i = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (i >= n_params) return;
@@ -504,8 +510,8 @@ __global__ void update_params_cuda(const int n_params, float* params, float* gra
     float m = beta1 * ms[i] + (1.0f - beta1) * grad;
     float v = beta2 * vs[i] + (1.0f - beta2) * grad * grad;
     // bias-correct both moments
-    float m_hat = m / beta1_correct;
-    float v_hat = v / beta2_correct;
+    float m_hat = m / (1.0f - powf(beta1, t));
+    float v_hat = v / (1.0f - powf(beta2, t));
 
     ms[i] = m;
     vs[i] = v;
@@ -541,7 +547,7 @@ void model_forward(Model* model, Acts* acts, float* imgs) {
     linear_forward(model->l2_w, model->l2_b, acts->relu_out, acts->l2_out, BATCH_SIZE, HIDDEN_SIZE, N_CLASSES);
 }
 
-void model_forward_backward(Model* model, Acts* acts, float* imgs, int* labels, int step, bool update) {
+void model_forward_backward(Model* model, Acts* acts, float* imgs, int* labels) {
     memset(model->grads, 0, model->n_params*sizeof(float));
     zero_acts(acts);
 
@@ -560,9 +566,6 @@ void model_forward_backward(Model* model, Acts* acts, float* imgs, int* labels, 
     matmul_backward(acts->dinp_l2, model->l2_w_grad, model->l2_b_grad, acts->dlogits, acts->relu_out, model->l2_w, BATCH_SIZE, HIDDEN_SIZE, N_CLASSES);
     relu_backward(acts->drelu, acts->l1_out, acts->dinp_l2, BATCH_SIZE, HIDDEN_SIZE);
     matmul_backward(acts->dinp_l1, model->l1_w_grad, model->l1_b_grad, acts->drelu, imgs, model->l1_w, BATCH_SIZE, IMG_SIZE, HIDDEN_SIZE);
-
-    if (update)
-        update_params(model, 1e-3f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
 }
 
 void model_forward_cuda(Model* model, Acts* acts, float* imgs) {
@@ -580,7 +583,7 @@ void model_forward_cuda(Model* model, Acts* acts, float* imgs) {
     linear_forward_cuda<<<gridDim3, blockDim3>>>(BATCH_SIZE, N_CLASSES, HIDDEN_SIZE, model->l2_w, model->l2_b, acts->relu_out, acts->l2_out);
 }
 
-void model_forward_backward_cuda(Model* model, Acts* acts, float* imgs, int* labels, int step, bool update) {
+void model_forward_backward_cuda(Model* model, Acts* acts, float* imgs, int* labels) {
     cudaMemset(model->grads, 0, model->n_params*sizeof(float));
     zero_acts_cuda(acts);
 
@@ -605,16 +608,7 @@ void model_forward_backward_cuda(Model* model, Acts* acts, float* imgs, int* lab
     relu_backward_cuda<<<gridDim2, blockDim2>>>(acts->drelu, acts->l1_out, acts->dinp_l2, BATCH_SIZE, HIDDEN_SIZE);
     matmul_backward_cuda(acts->dinp_l1, model->l1_w_grad, model->l1_b_grad, acts->drelu, imgs, model->l1_w, BATCH_SIZE, IMG_SIZE, HIDDEN_SIZE);
 
-    if (update) {
-        dim3 gridDimu(model->n_params/32, 1, 1);
-        dim3 blockDimu(32, 1, 1);
-        float beta1 = 0.9f;
-        float beta2 = 0.999f;
-        int t = step+1;
-        float beta1_correct = 1.0f - powf(beta1, t);
-        float beta2_correct = 1.0f - powf(beta2, t);
-        update_params_cuda<<<gridDimu,  blockDimu>>>(model->n_params, model->params, model->grads, model->m, model->v, 1e-3f, beta1, beta2, 1e-8f, 0.0f, t, beta1_correct, beta2_correct);
-    }
+
 }
 
 int array_argmax(float* x, size_t n) {
@@ -659,7 +653,7 @@ void compare_cpu_gpu() {
     int* labels = (int*)malloc(sizeof(int)*BATCH_SIZE);
     float* imgs = (float*)malloc(sizeof(float)*BATCH_SIZE*IMG_SIZE);
     get_batch(train_data, imgs, labels, train_samples);
-    model_forward_backward(&model, &acts, imgs, labels, 0, false);
+    model_forward_backward(&model, &acts, imgs, labels);
 
     float* cpu_l2_w_grad = (float*)malloc(sizeof(float)*HIDDEN_SIZE*N_CLASSES);
     memcpy(cpu_l2_w_grad, model.l2_w_grad, sizeof(float)*HIDDEN_SIZE*N_CLASSES);
@@ -683,7 +677,7 @@ void compare_cpu_gpu() {
     cudaMalloc(&imgs_d, sizeof(float)*BATCH_SIZE*IMG_SIZE);
     cudaMemcpy(imgs_d, imgs, sizeof(float)*BATCH_SIZE*IMG_SIZE, cudaMemcpyHostToDevice);
 
-    model_forward_backward_cuda(&model, &acts_d, imgs_d, labels_d, 0, false);
+    model_forward_backward_cuda(&model, &acts_d, imgs_d, labels_d);
 
     Acts gpu_acts = allocate_acts();
     copy_acts_from_device(acts_d, gpu_acts);
@@ -777,7 +771,8 @@ void train_cpu() {
         printf("\b%d/%d steps\r", batch_i, N_BATCHES);
         fflush(stdout);
         get_batch(train_data, imgs, labels, train_samples);
-        model_forward_backward(&model, &acts, imgs, labels, batch_i, true);
+        model_forward_backward(&model, &acts, imgs, labels);
+        update_params(&model, LR, BETA1, BETA2, EPS, WEIGHT_DECAY, batch_i+1);
     }
 
     int n_test_samples = 0;
@@ -830,7 +825,11 @@ void train_gpu() {
         get_batch(train_data, imgs, labels, train_samples);
         cudaMemcpy(labels_d, labels, sizeof(int)*BATCH_SIZE, cudaMemcpyHostToDevice);
         cudaMemcpy(imgs_d, imgs, sizeof(float)*BATCH_SIZE*IMG_SIZE, cudaMemcpyHostToDevice);
-        model_forward_backward_cuda(&model, &acts, imgs_d, labels_d, batch_i, true);
+
+        dim3 gridDimu(model.n_params/32, 1, 1);
+        dim3 blockDimu(32, 1, 1);
+        update_params_cuda<<<gridDimu,  blockDimu>>>(model.n_params, model.params, model.grads, model.m, model.v, LR, BETA1, BETA2, EPS, WEIGHT_DECAY, batch_i+1);
+        model_forward_backward_cuda(&model, &acts, imgs_d, labels_d);
     }
 
     int n_test_samples = 0;
