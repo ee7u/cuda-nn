@@ -1,16 +1,16 @@
+#include <cuda_runtime_api.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
 #include <assert.h>
-#include <string.h>
 
 #define IMG_SIZE 3072
-#define BATCH_SIZE 256
+#define BATCH_SIZE 1024
 #define N_BATCHES 1000
 #define N_CLASSES 10
-#define HIDDEN_SIZE 32
+#define HIDDEN_SIZE 256
 #define ROWS_PER_FILE 10000
 #define N_FILES 5
 #define LR 1e-3f
@@ -18,7 +18,6 @@
 #define BETA2 0.999f
 #define WEIGHT_DECAY 0.0f
 #define EPS 1e-8f
-
 
 #define L1_OUT_SIZE (BATCH_SIZE*HIDDEN_SIZE)
 #define RELU_OUT_SIZE (BATCH_SIZE*HIDDEN_SIZE)
@@ -265,55 +264,83 @@ void linear_forward(float* w, float* bias, float* inp, float* out, int B, int C,
         for (int o = 0; o < OC; o++) {
             float val = bias[o];
             for (int i = 0; i < C; i++) {
-                val += inp[b * C + i] * w[o*C + i];
+                val += inp[b * C + i] * w[i*OC + o];
             }
             out[b * OC + o] = val;
         }
     }
 }
 
-__global__ void linear_forward_cuda(int B, int OC, int C, const float* w, const float* bias, const float* inp, float* out) {
-  const uint o = blockIdx.x * blockDim.x + threadIdx.x;
-  const uint b = blockIdx.y * blockDim.y + threadIdx.y;
+__global__ void linear_forward_cuda(const float* a, const float* b, const float* bias, float* c, const int AX, const int AY, const int BX) {
+    const uint x = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint y = blockIdx.y * blockDim.y + threadIdx.y;
 
-  if (o < OC && b < B) {
-    float val = bias[o];
-    for (int i = 0; i < C; ++i) {
-      val += w[o * C + i] * inp[b * C + i];
+    if (x >= BX || y >= AY) return;
+
+    float acc = bias[x];
+    for (int k = 0; k < AX; k++) {
+        acc += a[y * AX + k] * b[k * BX + x];
     }
-    out[b*OC + o] = val;
-  }
+    c[y * BX + x] = acc;
+}
+
+__global__ void linear_forward_cuda_tiled(const float* a, const float* b, const float* bias, float* c, const int AX, const int AY, const int BX) {
+    #define TILE_SIZE 32
+    __shared__ float as[TILE_SIZE][TILE_SIZE];
+    __shared__ float bs[TILE_SIZE][TILE_SIZE];
+
+    const uint x = blockIdx.x * TILE_SIZE + threadIdx.x;
+    const uint y = blockIdx.y * TILE_SIZE + threadIdx.y;
+
+    float acc = bias[x];
+    for (int k = 0; k < max(AX, AY)/TILE_SIZE; k++) {
+        if (k*TILE_SIZE + threadIdx.x < AX && y < AY){
+            as[threadIdx.y][threadIdx.x] = a[y*AX + k*TILE_SIZE + threadIdx.x];
+        } else {
+            as[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        if (k*TILE_SIZE + threadIdx.y < AX && x < BX) {
+            bs[threadIdx.y][threadIdx.x] = b[(k*TILE_SIZE + threadIdx.y)*BX + x];
+        } else {
+            bs[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+        __syncthreads();
+
+        for (int i = 0; i < TILE_SIZE; i++) {
+            acc += as[threadIdx.y][i] * bs[i][threadIdx.x];
+        }
+        __syncthreads();
+    }
+    if (x < BX && y < AY) {
+        c[y*BX + x] = acc;
+    }
 }
 
 void matmul_backward(float* dinp, float* dweight, float* dbias,
                      const float* dout, const float* inp, const float* weight,
                      int B, int C, int OC) {
-    // weight, dweight OC, C
+    // weight, dweight C, OC
     // dinp, inp B, C
     // dout B, OC
     // dbias OC
 
     for (int b = 0; b < B; b++) {
-        const float* dout_bt = dout + b*OC;
-        float* dinp_bt = dinp + b*C;
-        for (int o = 0; o < OC; o++) {
-            const float* wrow = weight + o*C;
-            float d = dout_bt[o];
-            for (int i = 0; i < C; i++) {
-                dinp_bt[i] += wrow[i]*d;
+        for (int i = 0; i < C; i++) {
+            for (int o = 0; o < OC; o++) {
+                dinp[b*C + i] += weight[i*OC+o]*dout[b*OC + o];
             }
         }
     }
 
-    for (int o = 0; o < OC; o++) {
+    for (int i = 0; i < C; i++) {
         for (int b = 0; b < B; b++) {
-            const float* dout_bt = dout + b*OC;
-            const float* inp_bt = inp + b*C;
-            float* dwrow = dweight + o*C;
-            float d = dout_bt[o];
-            dbias[o] += d;
-            for (int i = 0; i < C; i++) {
-                dwrow[i] += inp_bt[i]*d;
+            for (int o = 0; o < OC; o++) {
+                float d = dout[b*OC + o];
+                if (i == 0) {
+                    dbias[o] += d;
+                }
+                dweight[i*OC + o] += inp[b*C + i]*d;
             }
         }
     }
@@ -326,33 +353,37 @@ __global__ void dinp_backward_cuda(float* dinp, const float* dout, const float* 
     if (i >= C || b >= B) return;
 
     for (int o = 0; o < OC; o++) {
-        dinp[b*C + i] += weight[o*C + i]*dout[b*OC + o];
+        dinp[b*C + i] += weight[i*OC + o]*dout[b*OC + o];
     }
 }
 
 __global__ void dweight_backward_cuda(float* dweight, float* dbias, const float* dout, const float* inp, const int B, const int C, const int OC) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    const int o = blockIdx.y * blockDim.y + threadIdx.y;
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    const int i = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (i >= C || o >= OC) return;
 
     float dweight_acc = 0.0f;
+    float dbias_acc = 0.0f;
     for (int b = 0; b < B; b++) {
         float d = dout[b*OC + o];
         dweight_acc += inp[b*C + i]*d;
-        if (i == 0) {
-            dbias[o] += d;
-        }
+        dbias_acc += d;
     }
 
-    dweight[o*C + i] = dweight_acc;
+    if (i == 0) {
+        dbias[o] = dbias_acc;
+    }
+
+    dweight[i*OC + o] = dweight_acc;
 }
 
 void matmul_backward_cuda(float* dinp, float* dweight, float* dbias, const float* dout, const float* inp, const float* weight, const int B, const int C, const int OC) {
     dim3 gridDim1(C/32, B/32, 1);
     dim3 blockDim1(32, 32, 1);
     dinp_backward_cuda<<<gridDim1, blockDim1>>>(dinp, dout, weight, B, C, OC);
-    dim3 gridDim2(C/32, OC/32 >= 32 ? OC : 1, 1);
+
+    dim3 gridDim2(OC >= 32 ? OC/32 : 1, C >= 32 ? C/32 : 1, 1);
     dim3 blockDim2(32, 32, 1);
     dweight_backward_cuda<<<gridDim2, blockDim2>>>(dweight, dbias, dout, inp, B, C, OC);
 }
@@ -395,7 +426,7 @@ void softmax_forward(float* probs, float* logits, int B, int C) {
         float* probs_bt = probs + b * C;
 
         // maxval is only calculated and subtracted for numerical stability
-        float maxval = -10000.0f; // TODO something better
+        float maxval = -10000.0f; // TODO: something better
         for (int i = 0; i < C; i++) {
             if (logits_bt[i] > maxval) {
                 maxval = logits_bt[i];
@@ -568,22 +599,22 @@ void model_forward_backward(Model* model, Acts* acts, float* imgs, int* labels) 
     matmul_backward(acts->dinp_l1, model->l1_w_grad, model->l1_b_grad, acts->drelu, imgs, model->l1_w, BATCH_SIZE, IMG_SIZE, HIDDEN_SIZE);
 }
 
-void model_forward_cuda(Model* model, Acts* acts, float* imgs) {
+void model_forward_cuda_naive(Model* model, Acts* acts, float* imgs) {
     cudaMemset(model->grads, 0, model->n_params*sizeof(float));
     zero_acts_cuda(acts);
 
     dim3 gridDim2(HIDDEN_SIZE/32, BATCH_SIZE/32, 1);
     dim3 blockDim2(32, 32, 1);
-    linear_forward_cuda<<<gridDim2, blockDim2>>>(BATCH_SIZE, HIDDEN_SIZE, IMG_SIZE, model->l1_w, model->l1_b, imgs, acts->l1_out);
+    linear_forward_cuda<<<gridDim2, blockDim2>>>(imgs, model->l1_w, model->l1_b, acts->l1_out, IMG_SIZE, BATCH_SIZE, HIDDEN_SIZE);
 
     relu_forward_cuda<<<gridDim2, blockDim2>>>(BATCH_SIZE, HIDDEN_SIZE, acts->l1_out, acts->relu_out);
 
     dim3 gridDim3(N_CLASSES >= 32 ? N_CLASSES/32 : 1, BATCH_SIZE/32, 1);
     dim3 blockDim3(32, 32, 1);
-    linear_forward_cuda<<<gridDim3, blockDim3>>>(BATCH_SIZE, N_CLASSES, HIDDEN_SIZE, model->l2_w, model->l2_b, acts->relu_out, acts->l2_out);
+    linear_forward_cuda<<<gridDim3, blockDim3>>>(acts->relu_out, model->l2_w, model->l2_b, acts->l2_out, HIDDEN_SIZE, BATCH_SIZE, N_CLASSES);
 }
 
-void model_forward_backward_cuda(Model* model, Acts* acts, float* imgs, int* labels) {
+void model_forward_backward_cuda_naive(Model* model, Acts* acts, float* imgs, int* labels) {
     cudaMemset(model->grads, 0, model->n_params*sizeof(float));
     zero_acts_cuda(acts);
 
@@ -592,13 +623,13 @@ void model_forward_backward_cuda(Model* model, Acts* acts, float* imgs, int* lab
 
     dim3 gridDim2(HIDDEN_SIZE/32, BATCH_SIZE/32, 1);
     dim3 blockDim2(32, 32, 1);
-    linear_forward_cuda<<<gridDim2, blockDim2>>>(BATCH_SIZE, HIDDEN_SIZE, IMG_SIZE, model->l1_w, model->l1_b, imgs, acts->l1_out);
+    linear_forward_cuda<<<gridDim2, blockDim2>>>(imgs, model->l1_w, model->l1_b, acts->l1_out, IMG_SIZE, BATCH_SIZE, HIDDEN_SIZE);
 
     relu_forward_cuda<<<gridDim2, blockDim2>>>(BATCH_SIZE, HIDDEN_SIZE, acts->l1_out, acts->relu_out);
 
     dim3 gridDim3(N_CLASSES >= 32 ? N_CLASSES/32 : 1, BATCH_SIZE/32, 1);
     dim3 blockDim3(32, 32, 1);
-    linear_forward_cuda<<<gridDim3, blockDim3>>>(BATCH_SIZE, N_CLASSES, HIDDEN_SIZE, model->l2_w, model->l2_b, acts->relu_out, acts->l2_out);
+    linear_forward_cuda<<<gridDim3, blockDim3>>>(acts->relu_out, model->l2_w, model->l2_b, acts->l2_out, HIDDEN_SIZE, BATCH_SIZE, N_CLASSES);
 
     softmax_forward_cuda<<<gridDim1, blockDim1>>>(acts->softmax_out, acts->l2_out, BATCH_SIZE, N_CLASSES);
     crossentropy_forward_cuda<<<gridDim1, blockDim1>>>(acts->loss, acts->softmax_out, labels, BATCH_SIZE, N_CLASSES);
@@ -607,8 +638,47 @@ void model_forward_backward_cuda(Model* model, Acts* acts, float* imgs, int* lab
     matmul_backward_cuda(acts->dinp_l2, model->l2_w_grad, model->l2_b_grad, acts->dlogits, acts->relu_out, model->l2_w, BATCH_SIZE, HIDDEN_SIZE, N_CLASSES);
     relu_backward_cuda<<<gridDim2, blockDim2>>>(acts->drelu, acts->l1_out, acts->dinp_l2, BATCH_SIZE, HIDDEN_SIZE);
     matmul_backward_cuda(acts->dinp_l1, model->l1_w_grad, model->l1_b_grad, acts->drelu, imgs, model->l1_w, BATCH_SIZE, IMG_SIZE, HIDDEN_SIZE);
+}
 
+void model_forward_cuda_optim(Model* model, Acts* acts, float* imgs) {
+    cudaMemset(model->grads, 0, model->n_params*sizeof(float));
+    zero_acts_cuda(acts);
 
+    dim3 gridDim2(HIDDEN_SIZE/32, BATCH_SIZE/32, 1);
+    dim3 blockDim2(32, 32, 1);
+    linear_forward_cuda_tiled<<<gridDim2, blockDim2>>>(imgs, model->l1_w, model->l1_b, acts->l1_out, IMG_SIZE, BATCH_SIZE, HIDDEN_SIZE);
+
+    relu_forward_cuda<<<gridDim2, blockDim2>>>(BATCH_SIZE, HIDDEN_SIZE, acts->l1_out, acts->relu_out);
+
+    dim3 gridDim3(N_CLASSES >= 32 ? N_CLASSES/32 : 1, BATCH_SIZE/32, 1);
+    dim3 blockDim3(32, 32, 1);
+    linear_forward_cuda_tiled<<<gridDim3, blockDim3>>>(acts->relu_out, model->l2_w, model->l2_b, acts->l2_out, HIDDEN_SIZE, BATCH_SIZE, N_CLASSES);
+}
+
+void model_forward_backward_cuda_optim(Model* model, Acts* acts, float* imgs, int* labels) {
+    cudaMemset(model->grads, 0, model->n_params*sizeof(float));
+    zero_acts_cuda(acts);
+
+    dim3 gridDim1(BATCH_SIZE/32, 1, 1);
+    dim3 blockDim1(32, 1, 1);
+
+    dim3 gridDim2(HIDDEN_SIZE/32, BATCH_SIZE/32, 1);
+    dim3 blockDim2(32, 32, 1);
+    linear_forward_cuda_tiled<<<gridDim2, blockDim2>>>(imgs, model->l1_w, model->l1_b, acts->l1_out, IMG_SIZE, BATCH_SIZE, HIDDEN_SIZE);
+
+    relu_forward_cuda<<<gridDim2, blockDim2>>>(BATCH_SIZE, HIDDEN_SIZE, acts->l1_out, acts->relu_out);
+
+    dim3 gridDim3(N_CLASSES >= 32 ? N_CLASSES/32 : 1, BATCH_SIZE/32, 1);
+    dim3 blockDim3(32, 32, 1);
+    linear_forward_cuda_tiled<<<gridDim3, blockDim3>>>(acts->relu_out, model->l2_w, model->l2_b, acts->l2_out, HIDDEN_SIZE, BATCH_SIZE, N_CLASSES);
+
+    softmax_forward_cuda<<<gridDim1, blockDim1>>>(acts->softmax_out, acts->l2_out, BATCH_SIZE, N_CLASSES);
+    crossentropy_forward_cuda<<<gridDim1, blockDim1>>>(acts->loss, acts->softmax_out, labels, BATCH_SIZE, N_CLASSES);
+
+    crossentropy_softmax_backward_cuda<<<gridDim3, blockDim3>>>(acts->dlogits, acts->dloss, acts->softmax_out, labels, BATCH_SIZE, N_CLASSES);
+    matmul_backward_cuda(acts->dinp_l2, model->l2_w_grad, model->l2_b_grad, acts->dlogits, acts->relu_out, model->l2_w, BATCH_SIZE, HIDDEN_SIZE, N_CLASSES);
+    relu_backward_cuda<<<gridDim2, blockDim2>>>(acts->drelu, acts->l1_out, acts->dinp_l2, BATCH_SIZE, HIDDEN_SIZE);
+    matmul_backward_cuda(acts->dinp_l1, model->l1_w_grad, model->l1_b_grad, acts->drelu, imgs, model->l1_w, BATCH_SIZE, IMG_SIZE, HIDDEN_SIZE);
 }
 
 int array_argmax(float* x, size_t n) {
@@ -636,12 +706,12 @@ bool fequal(const float a, const float b) {
     return abs(abs(a) - abs(b)) < 0.000001f;
 }
 
-void compare_cpu_gpu() {
+void compare_cpu_gpu(const char* optim) {
+    printf("Testing %s\n", optim);
     srand(time(NULL));
 
     unsigned char* data = (unsigned char*)malloc(N_FILES*ROWS_PER_FILE*(IMG_SIZE+1));
     load_data(data);
-
     size_t train_samples = 40000;
     unsigned char* train_data = data;
 
@@ -677,7 +747,12 @@ void compare_cpu_gpu() {
     cudaMalloc(&imgs_d, sizeof(float)*BATCH_SIZE*IMG_SIZE);
     cudaMemcpy(imgs_d, imgs, sizeof(float)*BATCH_SIZE*IMG_SIZE, cudaMemcpyHostToDevice);
 
-    model_forward_backward_cuda(&model, &acts_d, imgs_d, labels_d);
+    if (strcasecmp(optim, "NAIVE") == 0) {
+        model_forward_backward_cuda_naive(&model, &acts_d, imgs_d, labels_d);
+    }
+    else {
+        model_forward_backward_cuda_optim(&model, &acts_d, imgs_d, labels_d);
+    }
 
     Acts gpu_acts = allocate_acts();
     copy_acts_from_device(acts_d, gpu_acts);
@@ -752,9 +827,10 @@ void compare_cpu_gpu() {
 }
 
 void train_cpu() {
+    printf("Training cpu\n");
+
     unsigned char* data = (unsigned char*)malloc(N_FILES*ROWS_PER_FILE*(IMG_SIZE+1));
     load_data(data);
-
     size_t train_samples = 40000;
     size_t test_samples = 10000;
     unsigned char* train_data = data;
@@ -773,18 +849,19 @@ void train_cpu() {
         printf("\b%d/%d steps\r", batch_i+1, N_BATCHES);
         fflush(stdout);
 
-        clock_t batch_start = clock();
         get_batch(train_data, imgs, labels, train_samples);
+        clock_t batch_start = clock();
         model_forward_backward(&model, &acts, imgs, labels);
         update_params(&model, LR, BETA1, BETA2, EPS, WEIGHT_DECAY, batch_i+1);
         total_time += (clock() - batch_start);
     }
 
     double avg_batch_time = ((double)total_time) / CLOCKS_PER_SEC / N_BATCHES;
-    printf("\nAverage batch time (CPU): %.6f seconds\n", avg_batch_time);
+    printf("\nAverage train batch time (CPU): %.10f seconds\n", avg_batch_time);
 
     int n_test_samples = 0;
     int n_correct = 0;
+    total_time = 0;
     for (int i = 0; i < floor(test_samples/BATCH_SIZE); i++) {
         for (int b = 0; b < BATCH_SIZE; b++) {
             labels[b] = test_data[(i*BATCH_SIZE + b)*(IMG_SIZE+1)];
@@ -793,7 +870,9 @@ void train_cpu() {
             }
         }
 
+        clock_t batch_start = clock();
         model_forward(&model, &acts, imgs);
+        total_time += (clock() - batch_start);
         for (int b = 0; b < BATCH_SIZE; b++) {
             int pred = array_argmax(acts.l2_out+b*N_CLASSES, N_CLASSES);
             if (pred == labels[b]) {
@@ -802,13 +881,17 @@ void train_cpu() {
             n_test_samples++;
         }
     }
+    avg_batch_time = ((double)total_time) / CLOCKS_PER_SEC / N_BATCHES;
+    printf("\nAverage inference batch time (CPU): %.10f seconds\n", avg_batch_time);
     printf("Accuracy: %f\n", ((float)n_correct)/n_test_samples);
 }
 
-void train_gpu() {
+void train_gpu(const char* optim_str) {
+    printf("Training gpu: %s\n", optim_str);
+    const bool optim = strcasecmp(optim_str, "OPTIM") == 0;
+
     unsigned char* data = (unsigned char*)malloc(N_FILES*ROWS_PER_FILE*(IMG_SIZE+1));
     load_data(data);
-
     size_t train_samples = 40000;
     size_t test_samples = 10000;
     unsigned char* train_data = data;
@@ -833,23 +916,30 @@ void train_gpu() {
         printf("\b%d/%d steps\r", batch_i+1, N_BATCHES);
         fflush(stdout);
 
-        clock_t batch_start = clock();
         get_batch(train_data, imgs, labels, train_samples);
         cudaMemcpy(labels_d, labels, sizeof(int)*BATCH_SIZE, cudaMemcpyHostToDevice);
         cudaMemcpy(imgs_d, imgs, sizeof(float)*BATCH_SIZE*IMG_SIZE, cudaMemcpyHostToDevice);
 
+        cudaDeviceSynchronize();
+        clock_t batch_start = clock();
+        if (optim) {
+            model_forward_backward_cuda_optim(&model, &acts, imgs_d, labels_d);
+        } else {
+            model_forward_backward_cuda_naive(&model, &acts, imgs_d, labels_d);
+        }
         dim3 gridDimu(model.n_params/32, 1, 1);
         dim3 blockDimu(32, 1, 1);
         update_params_cuda<<<gridDimu,  blockDimu>>>(model.n_params, model.params, model.grads, model.m, model.v, LR, BETA1, BETA2, EPS, WEIGHT_DECAY, batch_i+1);
-        model_forward_backward_cuda(&model, &acts, imgs_d, labels_d);
+        cudaDeviceSynchronize();
         total_time += (clock() - batch_start);
     }
 
-    double avg_batch_time = ((double)total_time) / CLOCKS_PER_SEC / N_BATCHES;
-    printf("\nAverage batch time (GPU): %.6f seconds\n", avg_batch_time);
+    double avg_batch_time = (((double)total_time) / CLOCKS_PER_SEC) / N_BATCHES;
+    printf("\nAverage train batch time (GPU): %.10f seconds\n", avg_batch_time);
 
     int n_test_samples = 0;
     int n_correct = 0;
+    total_time = 0;
     for (int i = 0; i < floor(test_samples/BATCH_SIZE); i++) {
         for (int b = 0; b < BATCH_SIZE; b++) {
             labels[b] = test_data[(i*BATCH_SIZE + b)*(IMG_SIZE+1)];
@@ -859,7 +949,15 @@ void train_gpu() {
         }
 
         cudaMemcpy(imgs_d, imgs, sizeof(float)*BATCH_SIZE*IMG_SIZE, cudaMemcpyHostToDevice);
-        model_forward_cuda(&model, &acts, imgs_d);
+        cudaDeviceSynchronize();
+        clock_t batch_start = clock();
+        if (optim) {
+            model_forward_cuda_optim(&model, &acts, imgs_d);
+        } else {
+            model_forward_cuda_naive(&model, &acts, imgs_d);
+        }
+        cudaDeviceSynchronize();
+        total_time += (clock() - batch_start);
 
         Acts gpu_acts = allocate_acts();
         copy_acts_from_device(acts, gpu_acts);
@@ -872,6 +970,8 @@ void train_gpu() {
             n_test_samples++;
         }
     }
+    avg_batch_time = ((double)total_time) / CLOCKS_PER_SEC / N_BATCHES;
+    printf("\nAverage inference batch time (GPU): %.10f seconds\n", avg_batch_time);
     printf("Accuracy: %f\n", ((float)n_correct)/n_test_samples);
 }
 
@@ -879,15 +979,17 @@ int main(int argc, char* argv[]) {
     srand(time(NULL));
 
     if (argc == 1) {
-        train_gpu();
+        train_gpu("OPTIM");
     }
     else {
         if (strcasecmp(argv[1], "CPU") == 0) {
             train_cpu();
         } else if (strcasecmp(argv[1], "TEST") == 0) {
-            compare_cpu_gpu();
+            assert(argc == 3 && "Error: no optim level provided");
+            compare_cpu_gpu(argv[2]);
         } else if (strcasecmp(argv[1], "GPU") == 0) {
-            train_gpu();
+            assert(argc == 3 && "Error: no optim level provided");
+            train_gpu(argv[2]);
         } else {
             assert(false && "Invalid argument");
         }
