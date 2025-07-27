@@ -317,6 +317,39 @@ __global__ void linear_forward_cuda_tiled(const float* a, const float* b, const 
     }
 }
 
+__global__ void linear_forward_relu_cuda_tiled(const float* a, const float* b, const float* bias, float* c, const int AX, const int AY, const int BX) {
+    #define TILE_SIZE 32
+    __shared__ float as[TILE_SIZE][TILE_SIZE];
+    __shared__ float bs[TILE_SIZE][TILE_SIZE];
+
+    const uint x = blockIdx.x * TILE_SIZE + threadIdx.x;
+    const uint y = blockIdx.y * TILE_SIZE + threadIdx.y;
+
+    float acc = bias[x];
+    for (int k = 0; k < max(AX, AY)/TILE_SIZE; k++) {
+        if (k*TILE_SIZE + threadIdx.x < AX && y < AY){
+            as[threadIdx.y][threadIdx.x] = a[y*AX + k*TILE_SIZE + threadIdx.x];
+        } else {
+            as[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        if (k*TILE_SIZE + threadIdx.y < AX && x < BX) {
+            bs[threadIdx.y][threadIdx.x] = b[(k*TILE_SIZE + threadIdx.y)*BX + x];
+        } else {
+            bs[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+        __syncthreads();
+
+        for (int i = 0; i < TILE_SIZE; i++) {
+            acc += as[threadIdx.y][i] * bs[i][threadIdx.x];
+        }
+        __syncthreads();
+    }
+    if (x < BX && y < AY) {
+        c[y*BX + x] = max(acc, 0.0f);
+    }
+}
+
 void matmul_backward(float* dinp, float* dweight, float* dbias,
                      const float* dout, const float* inp, const float* weight,
                      int B, int C, int OC) {
@@ -734,9 +767,7 @@ void model_forward_cuda_optim(Model* model, Acts* acts, float* imgs) {
 
     dim3 gridDim2(HIDDEN_SIZE/32, BATCH_SIZE/32, 1);
     dim3 blockDim2(32, 32, 1);
-    linear_forward_cuda_tiled<<<gridDim2, blockDim2>>>(imgs, model->l1_w, model->l1_b, acts->l1_out, IMG_SIZE, BATCH_SIZE, HIDDEN_SIZE);
-
-    relu_forward_cuda<<<gridDim2, blockDim2>>>(BATCH_SIZE, HIDDEN_SIZE, acts->l1_out, acts->relu_out);
+    linear_forward_relu_cuda_tiled<<<gridDim2, blockDim2>>>(imgs, model->l1_w, model->l1_b, acts->relu_out, IMG_SIZE, BATCH_SIZE, HIDDEN_SIZE);
 
     dim3 gridDim3(N_CLASSES >= 32 ? N_CLASSES/32 : 1, BATCH_SIZE/32, 1);
     dim3 blockDim3(32, 32, 1);
@@ -752,9 +783,7 @@ void model_forward_backward_cuda_optim(Model* model, Acts* acts, float* imgs, in
 
     dim3 gridDim2(HIDDEN_SIZE/32, BATCH_SIZE/32, 1);
     dim3 blockDim2(32, 32, 1);
-    linear_forward_cuda_tiled<<<gridDim2, blockDim2>>>(imgs, model->l1_w, model->l1_b, acts->l1_out, IMG_SIZE, BATCH_SIZE, HIDDEN_SIZE);
-
-    relu_forward_cuda<<<gridDim2, blockDim2>>>(BATCH_SIZE, HIDDEN_SIZE, acts->l1_out, acts->relu_out);
+    linear_forward_relu_cuda_tiled<<<gridDim2, blockDim2>>>(imgs, model->l1_w, model->l1_b, acts->relu_out, IMG_SIZE, BATCH_SIZE, HIDDEN_SIZE);
 
     dim3 gridDim3(N_CLASSES >= 32 ? N_CLASSES/32 : 1, BATCH_SIZE/32, 1);
     dim3 blockDim3(32, 32, 1);
@@ -765,7 +794,7 @@ void model_forward_backward_cuda_optim(Model* model, Acts* acts, float* imgs, in
 
     crossentropy_softmax_backward_cuda<<<gridDim3, blockDim3>>>(acts->dlogits, acts->dloss, acts->softmax_out, labels, BATCH_SIZE, N_CLASSES);
     matmul_backward_cuda_tiled(acts->dinp_l2, model->l2_w_grad, model->l2_b_grad, acts->dlogits, acts->relu_out, model->l2_w, BATCH_SIZE, HIDDEN_SIZE, N_CLASSES);
-    relu_backward_cuda<<<gridDim2, blockDim2>>>(acts->drelu, acts->l1_out, acts->dinp_l2, BATCH_SIZE, HIDDEN_SIZE);
+    relu_backward_cuda<<<gridDim2, blockDim2>>>(acts->drelu, acts->relu_out, acts->dinp_l2, BATCH_SIZE, HIDDEN_SIZE);
     matmul_backward_cuda_tiled(acts->dinp_l1, model->l1_w_grad, model->l1_b_grad, acts->drelu, imgs, model->l1_w, BATCH_SIZE, IMG_SIZE, HIDDEN_SIZE);
 }
 
@@ -855,8 +884,10 @@ void compare_cpu_gpu(const char* optim) {
     float* gpu_l1_b_grad = (float*)malloc(sizeof(float)*HIDDEN_SIZE);
     cudaMemcpy(gpu_l1_b_grad, model.l1_b_grad, sizeof(float)*HIDDEN_SIZE, cudaMemcpyDeviceToHost);
 
-    for (int i = 0; i < L1_OUT_SIZE; i++) {
-        assert(fequal(acts.l1_out[i], gpu_acts.l1_out[i]));
+    if (strcasecmp(optim, "NAIVE") == 0) { // optim version doesn't have this because of matmul-relu kernel
+        for (int i = 0; i < L1_OUT_SIZE; i++) {
+            assert(fequal(acts.l1_out[i], gpu_acts.l1_out[i]));
+        }
     }
 
     for (int i = 0; i < RELU_OUT_SIZE; i++) {
@@ -970,7 +1001,7 @@ void train_cpu() {
         }
     }
     avg_batch_time = ((double)total_time) / CLOCKS_PER_SEC / N_BATCHES;
-    printf("\nAverage inference batch time (CPU): %.10f seconds\n", avg_batch_time);
+    printf("Average inference batch time (CPU): %.10f seconds\n", avg_batch_time);
     printf("Accuracy: %f\n", ((float)n_correct)/n_test_samples);
 }
 
@@ -1059,7 +1090,7 @@ void train_gpu(const char* optim_str) {
         }
     }
     avg_batch_time = ((double)total_time) / CLOCKS_PER_SEC / N_BATCHES;
-    printf("\nAverage inference batch time (GPU): %.10f seconds\n", avg_batch_time);
+    printf("Average inference batch time (GPU): %.10f seconds\n", avg_batch_time);
     printf("Accuracy: %f\n", ((float)n_correct)/n_test_samples);
 }
 
