@@ -393,37 +393,37 @@ __global__ void dinp_backward_cuda(float* dinp, const float* dout, const float* 
     }
 }
 
-__global__ void dinp_backward_cuda_tiled(const float* a, const float* b, float* c, const int AX, const int AY, const int CX) {
-    // dout @ weight, dout = (B, OC), weight = (C, OC), dinp = (B, C)
-    #define TILE_SIZE 32
-    __shared__ float as[TILE_SIZE][TILE_SIZE];
-    __shared__ float bs[TILE_SIZE][TILE_SIZE];
+__global__ void dinp_backward_cuda_tiled(const float* a, const float* b, float* c, const int ACOLS, const int AROWS, const int CCOLS) {
+    __shared__ float as[TILE_SIZE*TILE_SIZE];
+    __shared__ float bs[TILE_SIZE*TILE_SIZE];
 
-    const uint x = blockIdx.x * TILE_SIZE + threadIdx.x;
-    const uint y = blockIdx.y * TILE_SIZE + threadIdx.y;
+    const uint tCol = threadIdx.x % TILE_SIZE;
+    const uint tRow = threadIdx.x / TILE_SIZE;
+    const uint cCol = blockIdx.y*TILE_SIZE + tCol;
+    const uint cRow = blockIdx.x*TILE_SIZE + tRow;
 
     float acc = 0.0f;
-    for (int k = 0; k < max(AY, AX)/TILE_SIZE; k++) {
-        if (k*TILE_SIZE + threadIdx.x < AX && y < AY){
-            as[threadIdx.y][threadIdx.x] = a[y*AX + k*TILE_SIZE + threadIdx.x];
+    for (int k = 0; k < max(ACOLS, AROWS)/TILE_SIZE; k++) {
+        if (tCol + k*TILE_SIZE < ACOLS && cRow < AROWS){
+            as[tRow*TILE_SIZE + tCol] = a[cRow*ACOLS + tCol + k*TILE_SIZE];
         } else {
-            as[threadIdx.y][threadIdx.x] = 0.0f;
+            as[tRow*TILE_SIZE + tCol] = 0.0f;
         }
 
-        if (k*TILE_SIZE + threadIdx.y < AX && x < CX) {
-            bs[threadIdx.y][threadIdx.x] = b[x*AX + k*TILE_SIZE + threadIdx.y];
+        if (TILE_SIZE*k + tRow < ACOLS && cCol < CCOLS) {
+            bs[tRow*TILE_SIZE + tCol] = b[cCol*ACOLS + k*TILE_SIZE + tRow];
         } else {
-            bs[threadIdx.y][threadIdx.x] = 0.0f;
+            bs[tRow*TILE_SIZE + tCol] = 0.0f;
         }
         __syncthreads();
 
         for (int i = 0; i < TILE_SIZE; i++) {
-            acc += as[threadIdx.y][i] * bs[i][threadIdx.x];
+            acc += as[tRow*TILE_SIZE + i] * bs[i*TILE_SIZE + tCol];
         }
         __syncthreads();
     }
-    if (x < CX && y < AY) {
-        c[y*CX + x] = acc;
+    if (cCol < CCOLS && cRow < AROWS) {
+        c[cRow*CCOLS + cCol] = acc;
     }
 }
 
@@ -448,43 +448,42 @@ __global__ void dweight_backward_cuda(float* dweight, float* dbias, const float*
     dweight[i*OC + o] = dweight_acc;
 }
 
-__global__ void dweight_backward_cuda_tiled(const float* inp, const float* dout, float* dw, float* db, const int AX, const int AY, const int CX) {
-    // inp @ dout, transpose inp
-    // dweight = (C, OC), dout = (B, OC), inp = (B, C)
-    #define TILE_SIZE 32
-    __shared__ float as[TILE_SIZE][TILE_SIZE];
-    __shared__ float bs[TILE_SIZE][TILE_SIZE];
+__global__ void dweight_backward_cuda_tiled(const float* inp, const float* dout, float* dw, float* db, const int ACOLS, const int AROWS, const int CCOLS) {
+    __shared__ float as[TILE_SIZE*TILE_SIZE];
+    __shared__ float bs[TILE_SIZE*TILE_SIZE];
 
-    const uint x = blockIdx.x * TILE_SIZE + threadIdx.x;
-    const uint y = blockIdx.y * TILE_SIZE + threadIdx.y;
+    const uint tCol = threadIdx.x % TILE_SIZE;
+    const uint tRow = threadIdx.x / TILE_SIZE;
+    const uint cCol = blockIdx.y*TILE_SIZE + tCol;
+    const uint cRow = blockIdx.x*TILE_SIZE + tRow;
 
     float dw_acc = 0.0f;
     float db_acc = 0.0f;
-    for (int k = 0; k < AY/TILE_SIZE; k++) { // tile count kinda weird?
-        if (k*TILE_SIZE + threadIdx.x < AY && y < AX){
-            as[threadIdx.y][threadIdx.x] = inp[(k*TILE_SIZE+threadIdx.x)*AX + y];
+    for (int k = 0; k < AROWS/TILE_SIZE; k++) {
+        if (tCol + k*TILE_SIZE < AROWS && cRow < ACOLS){
+            as[tRow*TILE_SIZE + tCol] = inp[(tCol + k*TILE_SIZE)*ACOLS + cRow];
         } else {
-            as[threadIdx.y][threadIdx.x] = 0.0f;
+            as[tRow*TILE_SIZE + tCol] = 0.0f;
         }
 
-        if (k*TILE_SIZE + threadIdx.y < AY && x < CX) {
-            bs[threadIdx.y][threadIdx.x] = dout[(k*TILE_SIZE+threadIdx.y)*CX + x];
+        if (TILE_SIZE*k + tRow < AROWS && cCol < CCOLS) {
+            bs[tRow*TILE_SIZE + tCol] = dout[(k*TILE_SIZE + tRow)*CCOLS + cCol];
         } else {
-            bs[threadIdx.y][threadIdx.x] = 0.0f;
+            bs[tRow*TILE_SIZE + tCol] = 0.0f;
         }
         __syncthreads();
 
         for (int i = 0; i < TILE_SIZE; i++) {
-            float d = bs[i][threadIdx.x];
-            dw_acc += as[threadIdx.y][i] * d;
+            const float d = bs[i*TILE_SIZE + tCol];
+            dw_acc += as[tRow*TILE_SIZE + i] * d;
             db_acc += d;
         }
         __syncthreads();
     }
-    if (x < CX && y < AX) {
-        dw[y*CX + x] = dw_acc;
-        if (y == 0) {
-            db[x] = db_acc;
+    if (cCol < CCOLS && cRow < ACOLS) {
+        dw[cRow*CCOLS + cCol] = dw_acc;
+        if (cRow == 0) {
+            db[cCol] = db_acc;
         }
     }
 }
@@ -500,15 +499,15 @@ void matmul_backward_cuda(float* dinp, float* dweight, float* dbias, const float
 }
 
 void matmul_backward_cuda_tiled(float* dinp, float* dweight, float* dbias, const float* dout, const float* inp, const float* weight, const int B, const int C, const int OC) {
-    dim3 gridDim1(C/32, B/32, 1);
-    dim3 blockDim1(32, 32, 1);
     // dout @ weight, dout = (B, OC), weight = (C, OC), dinp = (B, C)
+    dim3 gridDim1(B/32, C>= 32 ? C/32 : 1);
+    dim3 blockDim1(32*32);
     dinp_backward_cuda_tiled<<<gridDim1, blockDim1>>>(dout, weight, dinp, OC, B, C);
 
-    dim3 gridDim2(OC >= 32 ? OC/32 : 1, C >= 32 ? C/32 : 1, 1);
-    dim3 blockDim2(32, 32, 1);
     // inp @ dout, transpose inp
     // dweight = (C, OC), dout = (B, OC), inp = (B, C)
+    dim3 gridDim2(C >= 32 ? C/32 : 1, OC >= 32 ? OC/32 : 1, 1);
+    dim3 blockDim2(32*32);
     dweight_backward_cuda_tiled<<<gridDim2, blockDim2>>>(inp, dout, dweight, dbias, C, B, OC);
 }
 
