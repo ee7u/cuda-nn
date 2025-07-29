@@ -20,6 +20,11 @@
 #define EPS 1e-8f
 #define TILE_SIZE 32
 
+#define BLOCK_ROWS 64
+#define BLOCK_COLS 64
+#define BLOCKTILE_ROWS 8
+#define BLOCKTILE_COLS 8
+
 #define L1_OUT_SIZE (BATCH_SIZE*HIDDEN_SIZE)
 #define RELU_OUT_SIZE (BATCH_SIZE*HIDDEN_SIZE)
 #define L2_OUT_SIZE (BATCH_SIZE*N_CLASSES)
@@ -319,6 +324,50 @@ __global__ void linear_forward_cuda_tiled(const float* a, const float* b, const 
     }
 }
 
+__global__ void linear_forward_cuda_blocktiled(const float* a, const float* b, const float* bias, float* c, const int ACOLS, const int AROWS, const int BCOLS) {
+    __shared__ float as[BLOCK_ROWS*BLOCKTILE_COLS];
+    __shared__ float bs[BLOCKTILE_COLS*BLOCK_COLS];
+
+    const uint cRow = blockIdx.y*BLOCK_ROWS;
+    const uint cCol = blockIdx.x*BLOCK_COLS;
+    const uint tCol = threadIdx.x % BLOCK_COLS;
+    const uint tRow = threadIdx.x / BLOCK_COLS;
+    const uint aCol = threadIdx.x % BLOCKTILE_COLS;
+    const uint aRow = threadIdx.x / BLOCKTILE_COLS;
+
+
+    float threadAccs[BLOCKTILE_ROWS] = {0.0};
+    for (uint i = 0; i < max(ACOLS, AROWS); i += BLOCKTILE_COLS) {
+        if (cRow + aRow < AROWS && aCol + i < ACOLS) {
+            as[aRow * BLOCKTILE_COLS + aCol] = a[(cRow + aRow) * ACOLS + aCol + i];
+        } else {
+            as[aRow * BLOCKTILE_COLS + aCol] = 0.0f;
+        }
+        if (tRow + i < ACOLS && tCol + cCol < BCOLS) {
+            bs[tRow * BLOCK_COLS + tCol] = b[(i + tRow) * BCOLS + tCol + cCol];
+        } else {
+            bs[tRow * BLOCK_COLS + tCol] = 0.0f;
+        }
+        __syncthreads();
+
+        for (uint tbCol = 0; tbCol < BLOCKTILE_COLS; ++tbCol) {
+            float tmpB = bs[tbCol * BLOCK_COLS + tCol];
+            for (uint tbRow = 0; tbRow < BLOCKTILE_ROWS; ++tbRow) {
+                threadAccs[tbRow] += as[(tRow * BLOCKTILE_ROWS + tbRow)*BLOCKTILE_COLS + tbCol]*tmpB;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (cCol + tCol >= BCOLS) return;
+    const float colBias = bias[cCol + tCol];
+    for (uint tbRow = 0; tbRow < BLOCKTILE_ROWS; ++tbRow) {
+        if ((tRow*BLOCKTILE_ROWS + cRow + tbRow) < AROWS) {
+            c[(tRow*BLOCKTILE_ROWS + cRow + tbRow)*BCOLS + cCol + tCol] = threadAccs[tbRow] + colBias;
+        }
+    }
+}
+
 __global__ void linear_forward_relu_cuda_tiled(const float* a, const float* b, const float* bias, float* c, const int ACOLS, const int AROWS, const int BCOLS) {
     __shared__ float as[TILE_SIZE*TILE_SIZE];
     __shared__ float bs[TILE_SIZE*TILE_SIZE];
@@ -350,6 +399,51 @@ __global__ void linear_forward_relu_cuda_tiled(const float* a, const float* b, c
     }
     if (cCol < BCOLS && cRow < AROWS) {
         c[cRow*BCOLS + cCol] = max(acc, 0.0f);
+    }
+}
+
+__global__ void linear_forward_relu_cuda_blocktiled(const float* a, const float* b, const float* bias, float* c, const int ACOLS, const int AROWS, const int BCOLS) {
+    __shared__ float as[BLOCK_ROWS*BLOCKTILE_COLS];
+    __shared__ float bs[BLOCKTILE_COLS*BLOCK_COLS];
+
+    const uint cRow = blockIdx.y*BLOCK_ROWS;
+    const uint cCol = blockIdx.x*BLOCK_COLS;
+    const uint tCol = threadIdx.x % BLOCK_COLS;
+    const uint tRow = threadIdx.x / BLOCK_COLS;
+    const uint aCol = threadIdx.x % BLOCKTILE_COLS;
+    const uint aRow = threadIdx.x / BLOCKTILE_COLS;
+
+    if (cCol + tCol >= BCOLS) return;
+
+    float threadAccs[BLOCKTILE_ROWS] = {0.0};
+    for (uint i = 0; i < max(ACOLS, AROWS); i += BLOCKTILE_COLS) {
+        if (cRow + aRow < AROWS && aCol + i < ACOLS) {
+            as[aRow * BLOCKTILE_COLS + aCol] = a[(cRow + aRow) * ACOLS + aCol + i];
+        } else {
+            as[aRow * BLOCKTILE_COLS + aCol] = 0.0f;
+        }
+        if (tRow + i < ACOLS && tCol + cCol < BCOLS) {
+            bs[tRow * BLOCK_COLS + tCol] = b[(i + tRow) * BCOLS + tCol + cCol];
+        } else {
+            bs[tRow * BLOCK_COLS + tCol] = 0.0f;
+        }
+        __syncthreads();
+
+        for (uint tbCol = 0; tbCol < BLOCKTILE_COLS; ++tbCol) {
+            float tmpB = bs[tbCol * BLOCK_COLS + tCol];
+            for (uint tbRow = 0; tbRow < BLOCKTILE_ROWS; ++tbRow) {
+                threadAccs[tbRow] += as[(tRow * BLOCKTILE_ROWS + tbRow)*BLOCKTILE_COLS + tbCol]*tmpB;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (cCol + tCol >= BCOLS) return;
+    const float colBias = bias[cCol + tCol];
+    for (uint tbRow = 0; tbRow < BLOCKTILE_ROWS; ++tbRow) {
+        if ((tRow*BLOCKTILE_ROWS + cRow + tbRow) < AROWS) {
+            c[(tRow*BLOCKTILE_ROWS + cRow + tbRow)*BCOLS + cCol + tCol] = max(threadAccs[tbRow] + colBias, 0.0f);
+        }
     }
 }
 
@@ -767,26 +861,26 @@ void model_forward_cuda_optim(Model* model, Acts* acts, float* imgs) {
     cudaMemset(model->grads, 0, model->n_params*sizeof(float));
     zero_acts_cuda(acts);
 
-    dim3 gridDim1(BATCH_SIZE/32, HIDDEN_SIZE/32);
-    dim3 blockDim1(32*32);
-    linear_forward_relu_cuda_tiled<<<gridDim1, blockDim1>>>(imgs, model->l1_w, model->l1_b, acts->relu_out, IMG_SIZE, BATCH_SIZE, HIDDEN_SIZE);
+    dim3 gridDim1(HIDDEN_SIZE/BLOCK_COLS, BATCH_SIZE/BLOCK_ROWS);
+    dim3 blockDim1((BLOCK_COLS*BLOCK_ROWS)/BLOCKTILE_ROWS);
+    linear_forward_relu_cuda_blocktiled<<<gridDim1, blockDim1>>>(imgs, model->l1_w, model->l1_b, acts->relu_out, IMG_SIZE, BATCH_SIZE, HIDDEN_SIZE);
 
-    dim3 gridDim2(BATCH_SIZE/32, N_CLASSES >= 32 ? N_CLASSES/32 : 1);
-    dim3 blockDim2(32*32);
-    linear_forward_cuda_tiled<<<gridDim2, blockDim2>>>(acts->relu_out, model->l2_w, model->l2_b, acts->l2_out, HIDDEN_SIZE, BATCH_SIZE, N_CLASSES);
+    dim3 gridDim2(N_CLASSES >= BLOCK_COLS ? N_CLASSES/BLOCK_COLS : 1, BATCH_SIZE/BLOCK_ROWS);
+    dim3 blockDim2((BLOCK_COLS*BLOCK_ROWS)/BLOCKTILE_ROWS);
+    linear_forward_cuda_blocktiled<<<gridDim2, blockDim2>>>(acts->relu_out, model->l2_w, model->l2_b, acts->l2_out, HIDDEN_SIZE, BATCH_SIZE, N_CLASSES);
 }
 
 void model_forward_backward_cuda_optim(Model* model, Acts* acts, float* imgs, int* labels) {
     cudaMemset(model->grads, 0, model->n_params*sizeof(float));
     zero_acts_cuda(acts);
 
-    dim3 gridDim1(BATCH_SIZE/32, HIDDEN_SIZE/32);
-    dim3 blockDim1(32*32);
-    linear_forward_relu_cuda_tiled<<<gridDim1, blockDim1>>>(imgs, model->l1_w, model->l1_b, acts->relu_out, IMG_SIZE, BATCH_SIZE, HIDDEN_SIZE);
+    dim3 gridDim1(HIDDEN_SIZE/BLOCK_COLS, BATCH_SIZE/BLOCK_ROWS);
+    dim3 blockDim1((BLOCK_COLS*BLOCK_ROWS)/BLOCKTILE_ROWS);
+    linear_forward_relu_cuda_blocktiled<<<gridDim1, blockDim1>>>(imgs, model->l1_w, model->l1_b, acts->relu_out, IMG_SIZE, BATCH_SIZE, HIDDEN_SIZE);
 
-    dim3 gridDim2(BATCH_SIZE/32, N_CLASSES >= 32 ? N_CLASSES/32 : 1);
-    dim3 blockDim2(32*32);
-    linear_forward_cuda_tiled<<<gridDim2, blockDim2>>>(acts->relu_out, model->l2_w, model->l2_b, acts->l2_out, HIDDEN_SIZE, BATCH_SIZE, N_CLASSES);
+    dim3 gridDim2(N_CLASSES >= BLOCK_COLS ? N_CLASSES/BLOCK_COLS : 1, BATCH_SIZE/BLOCK_ROWS);
+    dim3 blockDim2((BLOCK_COLS*BLOCK_ROWS)/BLOCKTILE_ROWS);
+    linear_forward_cuda_blocktiled<<<gridDim2, blockDim2>>>(acts->relu_out, model->l2_w, model->l2_b, acts->l2_out, HIDDEN_SIZE, BATCH_SIZE, N_CLASSES);
 
     dim3 gridDim3(BATCH_SIZE/32, 1, 1);
     dim3 blockDim3(32, 1, 1);
@@ -826,7 +920,7 @@ void load_data(unsigned char* data) {
 }
 
 bool fequal(const float a, const float b) {
-    return abs(abs(a) - abs(b)) < 0.000001f;
+    return abs(abs(a) - abs(b)) < 0.00001f;
 }
 
 void compare_cpu_gpu(const char* optim) {
