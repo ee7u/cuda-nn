@@ -335,7 +335,6 @@ __global__ void linear_forward_cuda_blocktiled(const float* a, const float* b, c
     const uint aCol = threadIdx.x % BLOCKTILE_COLS;
     const uint aRow = threadIdx.x / BLOCKTILE_COLS;
 
-
     float threadAccs[BLOCKTILE_ROWS] = {0.0};
     for (uint i = 0; i < max(ACOLS, AROWS); i += BLOCKTILE_COLS) {
         if (cRow + aRow < AROWS && aCol + i < ACOLS) {
@@ -412,8 +411,6 @@ __global__ void linear_forward_relu_cuda_blocktiled(const float* a, const float*
     const uint tRow = threadIdx.x / BLOCK_COLS;
     const uint aCol = threadIdx.x % BLOCKTILE_COLS;
     const uint aRow = threadIdx.x / BLOCKTILE_COLS;
-
-    if (cCol + tCol >= BCOLS) return;
 
     float threadAccs[BLOCKTILE_ROWS] = {0.0};
     for (uint i = 0; i < max(ACOLS, AROWS); i += BLOCKTILE_COLS) {
@@ -521,6 +518,48 @@ __global__ void dinp_backward_cuda_tiled(const float* a, const float* b, float* 
     }
 }
 
+__global__ void dinp_backward_cuda_blocktiled(const float* a, const float* b, float* c, const int ACOLS, const int AROWS, const int CCOLS) {
+    __shared__ float as[BLOCK_ROWS*BLOCKTILE_COLS];
+    __shared__ float bs[BLOCKTILE_COLS*BLOCK_COLS];
+
+    const uint cRow = blockIdx.y*BLOCK_ROWS;
+    const uint cCol = blockIdx.x*BLOCK_COLS;
+    const uint tCol = threadIdx.x % BLOCK_COLS;
+    const uint tRow = threadIdx.x / BLOCK_COLS;
+    const uint aCol = threadIdx.x % BLOCKTILE_COLS;
+    const uint aRow = threadIdx.x / BLOCKTILE_COLS;
+
+    float threadAccs[BLOCKTILE_ROWS] = {0.0};
+    for (uint i = 0; i < max(ACOLS, AROWS); i += BLOCKTILE_COLS) {
+        if (cRow + aRow < AROWS && aCol + i < ACOLS) {
+            as[aRow * BLOCKTILE_COLS + aCol] = a[(cRow + aRow) * ACOLS + aCol + i];
+        } else {
+            as[aRow * BLOCKTILE_COLS + aCol] = 0.0f;
+        }
+        if (tRow + i < ACOLS && tCol + cCol < CCOLS) {
+            bs[tRow * BLOCK_COLS + tCol] = b[(tCol + cCol) * ACOLS + i + tRow];
+        } else {
+            bs[tRow * BLOCK_COLS + tCol] = 0.0f;
+        }
+        __syncthreads();
+
+        for (uint tbCol = 0; tbCol < BLOCKTILE_COLS; ++tbCol) {
+            float tmpB = bs[tbCol * BLOCK_COLS + tCol];
+            for (uint tbRow = 0; tbRow < BLOCKTILE_ROWS; ++tbRow) {
+                threadAccs[tbRow] += as[(tRow * BLOCKTILE_ROWS + tbRow)*BLOCKTILE_COLS + tbCol]*tmpB;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (cCol + tCol >= CCOLS) return;
+    for (uint tbRow = 0; tbRow < BLOCKTILE_ROWS; ++tbRow) {
+        if ((tRow*BLOCKTILE_ROWS + cRow + tbRow) < AROWS) {
+            c[(tRow*BLOCKTILE_ROWS + cRow + tbRow)*CCOLS + cCol + tCol] = threadAccs[tbRow];
+        }
+    }
+}
+
 __global__ void dweight_backward_cuda(float* dweight, float* dbias, const float* dout, const float* inp, const int B, const int C, const int OC) {
     const int o = blockIdx.x * blockDim.x + threadIdx.x;
     const int i = blockIdx.y * blockDim.y + threadIdx.y;
@@ -582,6 +621,53 @@ __global__ void dweight_backward_cuda_tiled(const float* inp, const float* dout,
     }
 }
 
+__global__ void dweight_backward_cuda_blocktiled(const float* inp, const float* dout, float* dw, float* db, const int ACOLS, const int AROWS, const int CCOLS) {
+    __shared__ float as[BLOCK_ROWS*BLOCKTILE_COLS];
+    __shared__ float bs[BLOCKTILE_COLS*BLOCK_COLS];
+
+    const uint cRow = blockIdx.y*BLOCK_ROWS;
+    const uint cCol = blockIdx.x*BLOCK_COLS;
+    const uint tCol = threadIdx.x % BLOCK_COLS;
+    const uint tRow = threadIdx.x / BLOCK_COLS;
+    const uint aCol = threadIdx.x % BLOCKTILE_COLS;
+    const uint aRow = threadIdx.x / BLOCKTILE_COLS;
+
+    float threadDwAccs[BLOCKTILE_ROWS] = {0.0};
+    float threadDbAccs[BLOCKTILE_ROWS] = {0.0};
+    for (uint i = 0; i < max(ACOLS, AROWS); i += BLOCKTILE_COLS) {
+        if (cRow + aRow < ACOLS && aCol + i < AROWS) {
+            as[aRow * BLOCKTILE_COLS + aCol] = inp[(aCol + i) * ACOLS + cRow + aRow];
+        } else {
+            as[aRow * BLOCKTILE_COLS + aCol] = 0.0f;
+        }
+        if (tRow + i < AROWS && tCol + cCol < CCOLS) {
+            bs[tRow * BLOCK_COLS + tCol] = dout[(i + tRow) * CCOLS + tCol + cCol];
+        } else {
+            bs[tRow * BLOCK_COLS + tCol] = 0.0f;
+        }
+        __syncthreads();
+
+        for (uint tbCol = 0; tbCol < BLOCKTILE_COLS; ++tbCol) {
+            float tmpB = bs[tbCol * BLOCK_COLS + tCol];
+            for (uint tbRow = 0; tbRow < BLOCKTILE_ROWS; ++tbRow) {
+                threadDwAccs[tbRow] += as[(tRow * BLOCKTILE_ROWS + tbRow)*BLOCKTILE_COLS + tbCol]*tmpB;
+                threadDbAccs[tbRow] += tmpB;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (cCol + tCol >= CCOLS) return;
+    for (uint tbRow = 0; tbRow < BLOCKTILE_ROWS; ++tbRow) {
+        if ((tRow*BLOCKTILE_ROWS + cRow + tbRow) < ACOLS) {
+            dw[(tRow*BLOCKTILE_ROWS + cRow + tbRow)*CCOLS + cCol + tCol] = threadDwAccs[tbRow];
+            if (cRow == 0) {
+                db[cCol + tCol] = threadDbAccs[tbRow];
+            }
+        }
+    }
+}
+
 void matmul_backward_cuda(float* dinp, float* dweight, float* dbias, const float* dout, const float* inp, const float* weight, const int B, const int C, const int OC) {
     dim3 gridDim1(C/32, B/32, 1);
     dim3 blockDim1(32, 32, 1);
@@ -594,15 +680,15 @@ void matmul_backward_cuda(float* dinp, float* dweight, float* dbias, const float
 
 void matmul_backward_cuda_tiled(float* dinp, float* dweight, float* dbias, const float* dout, const float* inp, const float* weight, const int B, const int C, const int OC) {
     // dout @ weight, dout = (B, OC), weight = (C, OC), dinp = (B, C)
-    dim3 gridDim1(B/32, C>= 32 ? C/32 : 1);
-    dim3 blockDim1(32*32);
-    dinp_backward_cuda_tiled<<<gridDim1, blockDim1>>>(dout, weight, dinp, OC, B, C);
+    dim3 gridDim1(C>= BLOCK_COLS ? C/BLOCK_COLS : 1, B/BLOCK_ROWS);
+    dim3 blockDim1((BLOCK_COLS*BLOCK_ROWS)/BLOCKTILE_ROWS);
+    dinp_backward_cuda_blocktiled<<<gridDim1, blockDim1>>>(dout, weight, dinp, OC, B, C);
 
     // inp @ dout, transpose inp
     // dweight = (C, OC), dout = (B, OC), inp = (B, C)
-    dim3 gridDim2(C >= 32 ? C/32 : 1, OC >= 32 ? OC/32 : 1, 1);
-    dim3 blockDim2(32*32);
-    dweight_backward_cuda_tiled<<<gridDim2, blockDim2>>>(inp, dout, dweight, dbias, C, B, OC);
+    dim3 gridDim2(OC >= BLOCK_COLS ? OC/BLOCK_COLS : 1, C >= BLOCK_ROWS ? C/BLOCK_ROWS : 1);
+    dim3 blockDim2((BLOCK_COLS*BLOCK_ROWS)/BLOCKTILE_ROWS);
+    dweight_backward_cuda_blocktiled<<<gridDim2, blockDim2>>>(inp, dout, dweight, dbias, C, B, OC);
 }
 
 void relu_forward(float *inp, float *out, int B, int C) {
